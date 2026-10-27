@@ -1,36 +1,36 @@
 import os
-import sys
 import time
 import json
 import shutil
 import asyncio
-import hashlib
-import subprocess
-import threading
-import traceback
-import re
-from urllib.parse import quote_plus
-
-# Автоматическая установка и подключение imageio-ffmpeg / ffmpeg
-try:
-    import imageio_ffmpeg
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["PATH"] += os.pathsep + os.path.dirname(FFMPEG_PATH)
-except ModuleNotFoundError:
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio-ffmpeg"])
-        import imageio_ffmpeg
-        FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-        os.environ["PATH"] += os.pathsep + os.path.dirname(FFMPEG_PATH)
-    except Exception:
-        FFMPEG_PATH = shutil.which("ffmpeg") or "ffmpeg"
-
 import requests
+import threading
+import re
+import subprocess
+import traceback
+import hashlib
+from urllib.parse import quote_plus
+import imageio_ffmpeg
+
+_RAW_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+_FFMPEG_DIR = os.path.dirname(_RAW_FFMPEG)
+_STD_FFMPEG_NAME = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+FFMPEG_PATH = os.path.join(_FFMPEG_DIR, _STD_FFMPEG_NAME)
+
+if not os.path.exists(FFMPEG_PATH):
+    try:
+        shutil.copyfile(_RAW_FFMPEG, FFMPEG_PATH)
+        if os.name != "nt":
+            os.chmod(FFMPEG_PATH, 0o755)
+    except Exception:
+        FFMPEG_PATH = _RAW_FFMPEG
+
+os.environ["PATH"] = _FFMPEG_DIR + os.pathsep + os.environ.get("PATH", "")
+
 from telebot import TeleBot, types, apihelper
 from yt_dlp import YoutubeDL
 from shazamio import Shazam
 
-# Увеличиваем глобальные таймауты для отправки тяжелых файлов (по умолчанию 15 сек)
 apihelper.READ_TIMEOUT = 120
 apihelper.CONNECT_TIMEOUT = 30
 
@@ -96,32 +96,45 @@ def get_video_duration(video_path):
     return 0
 
 
-def extract_audio_segment(video_path, audio_path, ss=None, t=None):
-    cmd = [FFMPEG_PATH, "-y"]
-    if ss is not None:
+def extract_audio_segment(video_path, audio_path, ss=None, t=None, af_filter=None):
+    cmd = [FFMPEG_PATH, "-y", "-i", video_path]
+    if ss is not None and ss > 0:
         cmd += ["-ss", str(ss)]
-    cmd += ["-i", video_path]
     if t is not None:
         cmd += ["-t", str(t)]
-    cmd += ["-vn", "-acodec", "libmp3lame", "-q:a", "4", audio_path]
+    if af_filter:
+        cmd += ["-af", af_filter]
+    cmd += [
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",
+        "-ac", "1",
+        audio_path
+    ]
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 4000:
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[FFmpeg Extract Error]: {e}")
     return False
+
+
+async def _shazam_async(audio_path):
+    shazam = Shazam()
+    if hasattr(shazam, "recognize"):
+        return await shazam.recognize(audio_path)
+    return await shazam.recognize_song(audio_path)
 
 
 def shazam_recognize(audio_path):
     loop = asyncio.new_event_loop()
     try:
-        shazam = Shazam()
-        result = loop.run_until_complete(shazam.recognize(audio_path))
-        matches = result.get("matches", [])
-        if not matches:
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(_shazam_async(audio_path))
+        if not result:
             return None
-        track = result.get("track", {})
+        track = result.get("track")
         if not track:
             return None
         return {
@@ -130,10 +143,14 @@ def shazam_recognize(audio_path):
             "artwork": track.get("images", {}).get("coverarthq", ""),
             "url": track.get("url", ""),
         }
-    except Exception:
+    except Exception as e:
+        print(f"[Shazam Error]: {e}")
         return None
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 def extract_and_recognize(video_path):
@@ -141,18 +158,26 @@ def extract_and_recognize(video_path):
     base = os.path.splitext(video_path)[0]
 
     segments = []
-    if duration > 10:
-        segments.append(("start", 0, 12))
-        mid = max(0, duration // 2 - 6)
-        segments.append(("middle", mid, 12))
-        if duration > 20:
-            segments.append(("late", max(0, duration - 15), 12))
+    if duration <= 10:
+        segments.append(("full", 0, 10, None))
+    elif duration <= 20:
+        mid = max(1, duration // 2 - 4)
+        segments.append(("mid", mid, 8, None))
+        segments.append(("start", 1, 8, None))
     else:
-        segments.append(("full", None, None))
+        mid = max(2, duration // 2 - 4)
+        segments.append(("mid", mid, 8, None))
+        segments.append(("early", 2, 8, None))
+        segments.append(("late", max(2, duration - 12), 8, None))
 
-    for name, ss, t in segments:
-        audio_path = f"{base}_shazam_{name}.mp3"
-        if extract_audio_segment(video_path, audio_path, ss, t):
+    mid_point = max(1, duration // 2 - 4) if duration > 10 else 0
+    seg_len = 8 if duration > 10 else None
+    segments.append(("un_spedup", mid_point, seg_len, "asetrate=16000*0.85,aresample=16000"))
+    segments.append(("un_slowed", mid_point, seg_len, "asetrate=16000*1.18,aresample=16000"))
+
+    for name, ss, t, af in segments:
+        audio_path = f"{base}_shazam_{name}.wav"
+        if extract_audio_segment(video_path, audio_path, ss, t, af_filter=af):
             result = shazam_recognize(audio_path)
             try:
                 os.remove(audio_path)
@@ -323,9 +348,10 @@ def show_track_selection(message, query_text, status_msg=None):
 
             markup = build_search_keyboard(session_id, page=0, per_page=9)
             bot.edit_message_text(
-                "🔎",
+                f"🎵 Найдено по запросу: <b>{query_text}</b>",
                 chat_id,
                 status_msg.message_id,
+                parse_mode="HTML",
                 reply_markup=markup
             )
         except Exception:
@@ -565,7 +591,11 @@ def handle_shazam(call):
     except Exception:
         pass
 
-    status_msg = bot.send_message(chat_id, "🔎", reply_to_message_id=call.message.reply_to_message.message_id if call.message.reply_to_message else call.message.message_id)
+    status_msg = bot.send_message(
+        chat_id,
+        "🔎",
+        reply_to_message_id=call.message.reply_to_message.message_id if call.message.reply_to_message else call.message.message_id
+    )
 
     threading.Thread(
         target=recognize_and_show_options,
@@ -623,7 +653,7 @@ def handle_telegram_media_shazam(message, target_msg):
     threading.Thread(target=worker, daemon=True).start()
 
 
-@bot.message_handler(content_types=['video', 'video_note', 'voice', 'document'])
+@bot.message_handler(content_types=['video', 'video_note', 'voice', 'audio', 'document'])
 def handle_direct_media(message):
     if not extract_telegram_media_file_id(message):
         return
