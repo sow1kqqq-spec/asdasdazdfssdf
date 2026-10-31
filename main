@@ -1,7 +1,9 @@
 import os
+import io
 import time
 import json
 import shutil
+import random
 import asyncio
 import requests
 import threading
@@ -9,8 +11,13 @@ import re
 import subprocess
 import traceback
 import hashlib
-from urllib.parse import quote_plus
+import logging
+from urllib.parse import quote_plus, urlparse, unquote
+import functools
 import imageio_ffmpeg
+from PIL import Image, ImageDraw, ImageFont
+
+print = functools.partial(print, flush=True)
 
 _RAW_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 _FFMPEG_DIR = os.path.dirname(_RAW_FFMPEG)
@@ -31,10 +38,12 @@ from telebot import TeleBot, types, apihelper
 from yt_dlp import YoutubeDL
 from shazamio import Shazam
 
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
 apihelper.READ_TIMEOUT = 120
 apihelper.CONNECT_TIMEOUT = 30
 
-BOT_TOKEN = "8983080155:AAHQ9ZDw1N7TZhkEIvOIzl5ySlhhG1k_u68"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8983080155:AAHQ9ZDw1N7TZhkEIvOIzl5ySlhhG1k_u68").strip()
 bot = TeleBot(BOT_TOKEN, num_threads=16)
 
 DOWNLOAD_DIR = "downloads"
@@ -44,6 +53,7 @@ video_cache = {}
 text_search_cache = {}
 search_session_cache = {}
 shazam_video_cache = {}
+tg_file_shazam_cache = {}
 
 STORAGE_FILE = "storage_chat_id.txt"
 
@@ -54,6 +64,24 @@ HEADERS = {
 
 http_session = requests.Session()
 http_session.headers.update(HEADERS)
+
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "f3919b38ccbd318f14e539e930efd9cf").strip()
+
+
+def safe_reply(message, text, **kwargs):
+    try:
+        return bot.reply_to(message, text, **kwargs)
+    except Exception:
+        return None
+
+
+def safe_edit(text, chat_id, message_id, **kwargs):
+    if not message_id:
+        return
+    try:
+        bot.edit_message_text(text, chat_id, message_id, **kwargs)
+    except Exception:
+        pass
 
 
 def get_storage_chat_id():
@@ -79,6 +107,289 @@ E_SEND = '<tg-emoji emoji-id="5377811534384768829">\U0001f4e4</tg-emoji>'
 E_WAVE = '<tg-emoji emoji-id="5260607902716036593">\U0001f44b</tg-emoji>'
 
 
+# ==================== ГЕНЕРАТОР СТИКЕРОВ-ЦИТАТ (/q в стиле iOS) ====================
+
+NAME_COLORS = [
+    (210, 45, 45),     # Яркий красный
+    (0, 115, 230),     # iOS Синий
+    (40, 160, 60),     # Зеленый
+    (220, 130, 0),     # Оранжевый
+    (140, 60, 210),    # Фиолетовый
+    (210, 40, 140),    # Розовый
+]
+
+
+def _has_cjk(text):
+    return bool(re.search(r'[\u3000-\u9fff\uf900-\ufaff\uff00-\uffef]', text or ''))
+
+
+def _load_font(size, bold=False, text_sample=""):
+    candidates = []
+    if os.name == "nt":
+        win_fonts = os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts")
+        if _has_cjk(text_sample):
+            candidates += [
+                os.path.join(win_fonts, "msyhbd.ttc" if bold else "msyh.ttc"),
+                os.path.join(win_fonts, "YuGothB.ttc" if bold else "YuGothM.ttc"),
+                os.path.join(win_fonts, "msgothic.ttc"),
+                os.path.join(win_fonts, "malgunbd.ttf" if bold else "malgun.ttf"),
+            ]
+        if bold:
+            candidates += [
+                os.path.join(win_fonts, "segoeuib.ttf"),
+                os.path.join(win_fonts, "arialbd.ttf"),
+                os.path.join(win_fonts, "msyhbd.ttc"),
+            ]
+        else:
+            candidates += [
+                os.path.join(win_fonts, "segoeui.ttf"),
+                os.path.join(win_fonts, "arial.ttf"),
+                os.path.join(win_fonts, "msyh.ttc"),
+            ]
+    else:
+        if _has_cjk(text_sample):
+            candidates += [
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc" if bold else "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            ]
+        if bold:
+            candidates += [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            ]
+        else:
+            candidates += [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ]
+
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def _get_user_avatar_image(user_id, first_name, color_rgb, size=78):
+    avatar_img = None
+    try:
+        photos = bot.get_user_profile_photos(user_id, limit=1)
+        if photos and photos.total_count > 0 and photos.photos:
+            file_id = photos.photos[0][-1].file_id
+            file_info = bot.get_file(file_id)
+            raw_bytes = bot.download_file(file_info.file_path)
+            avatar_img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+            avatar_img = avatar_img.resize((size, size), Image.Resampling.LANCZOS)
+    except Exception:
+        avatar_img = None
+
+    if avatar_img is None:
+        avatar_img = Image.new("RGBA", (size, size), (*color_rgb, 255))
+        draw = ImageDraw.Draw(avatar_img)
+        letter = (first_name or "?")[0].upper()
+        font_init = _load_font(int(size * 0.46), bold=True, text_sample=letter)
+        bbox = draw.textbbox((0, 0), letter, font=font_init)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(
+            ((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1]),
+            letter,
+            font=font_init,
+            fill=(255, 255, 255, 255)
+        )
+
+    mask = Image.new("L", (size, size), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.ellipse((0, 0, size - 1, size - 1), fill=255)
+
+    circle_avatar = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    circle_avatar.paste(avatar_img, (0, 0), mask)
+    return circle_avatar
+
+
+def _wrap_text_by_pixel_width(draw, text, font, max_width):
+    lines = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        words = paragraph.split(" ")
+        current_line = ""
+        for word in words:
+            test_line = f"{current_line} {word}".strip() if current_line else word
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            if (bbox[2] - bbox[0]) <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                w_bbox = draw.textbbox((0, 0), word, font=font)
+                if (w_bbox[2] - w_bbox[0]) > max_width:
+                    chunk = ""
+                    for ch in word:
+                        t_chunk = chunk + ch
+                        if (draw.textbbox((0, 0), t_chunk, font=font)[2]) <= max_width:
+                            chunk = t_chunk
+                        else:
+                            lines.append(chunk)
+                            chunk = ch
+                    current_line = chunk
+                else:
+                    current_line = word
+        if current_line:
+            lines.append(current_line)
+    return lines or [""]
+
+
+def create_quote_sticker_webp(user_id, display_name, quote_text):
+    font_name = _load_font(24, bold=True, text_sample=display_name)
+    font_text = _load_font(26, bold=False, text_sample=quote_text)
+
+    dummy_img = Image.new("RGBA", (10, 10))
+    dummy_draw = ImageDraw.Draw(dummy_img)
+
+    max_text_width = 340
+    wrapped_lines = _wrap_text_by_pixel_width(dummy_draw, quote_text, font_text, max_text_width)
+
+    name_bbox = dummy_draw.textbbox((0, 0), display_name, font=font_name)
+    name_w = name_bbox[2] - name_bbox[0]
+    name_h = name_bbox[3] - name_bbox[1]
+
+    line_heights = []
+    max_line_w = 0
+    for ln in wrapped_lines:
+        if ln:
+            bb = dummy_draw.textbbox((0, 0), ln, font=font_text)
+            lw = bb[2] - bb[0]
+            lh = bb[3] - bb[1]
+        else:
+            lw, lh = 0, 18
+        max_line_w = max(max_line_w, lw)
+        line_heights.append(max(lh, 28))
+
+    pad_x = 22
+    pad_y = 16
+    line_spacing = 6
+
+    content_w = max(name_w, max_line_w)
+    bubble_w = max(140, content_w + pad_x * 2)
+    total_text_h = sum(line_heights) + line_spacing * max(0, len(wrapped_lines) - 1)
+    bubble_h = max(76, pad_y * 2 + name_h + 8 + total_text_h)
+
+    avatar_size = 78
+    gap = 14
+    margin = 32
+
+    actual_w = margin * 2 + avatar_size + gap + bubble_w
+    actual_h = margin * 2 + max(avatar_size, bubble_h)
+
+    # Нормальный размер стикера (512px по большей стороне)
+    canvas = Image.new("RGBA", (actual_w, actual_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    color_idx = abs(int(user_id or 0)) % len(NAME_COLORS)
+    name_color = NAME_COLORS[color_idx]
+
+    avatar_img = _get_user_avatar_image(user_id, display_name, name_color, size=avatar_size)
+    canvas.paste(avatar_img, (margin, margin), avatar_img)
+
+    bubble_x = margin + avatar_size + gap
+    bubble_y = margin
+    bubble_rect = [bubble_x, bubble_y, bubble_x + bubble_w, bubble_y + bubble_h]
+
+    # iOS стиль: полупрозрачное белое стекло (alpha = 205) + тонкая светлая рамка
+    bubble_fill = (255, 255, 255, 205)
+    bubble_outline = (255, 255, 255, 120)
+
+    draw.rounded_rectangle(
+        bubble_rect,
+        radius=26,
+        fill=bubble_fill,
+        outline=bubble_outline,
+        width=2
+    )
+
+    cur_x = bubble_x + pad_x
+    cur_y = bubble_y + pad_y
+    # Имя в стиле iOS (темное или цветное)
+    draw.text((cur_x, cur_y - name_bbox[1]), display_name, font=font_name, fill=(*name_color, 255))
+    cur_y += name_h + 8
+
+    # Текст сообщения в облачке (темно-серый/черный для читаемости на белом)
+    for idx, ln in enumerate(wrapped_lines):
+        if ln:
+            bb = draw.textbbox((0, 0), ln, font=font_text)
+            draw.text((cur_x, cur_y - bb[1]), ln, font=font_text, fill=(20, 24, 30, 255))
+        cur_y += line_heights[idx] + line_spacing
+
+    # Масштабируем до ровно 512px под требования Telegram-стикеров
+    max_side = max(actual_w, actual_h)
+    if max_side != 512:
+        scale = 512.0 / max_side
+        new_w = max(1, min(512, int(round(actual_w * scale))))
+        new_h = max(1, min(512, int(round(actual_h * scale))))
+        canvas = canvas.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    out_buf = io.BytesIO()
+    canvas.save(out_buf, format="WEBP", quality=95)
+    out_buf.seek(0)
+    return out_buf
+
+
+@bot.message_handler(commands=['q', 'quote'])
+def handle_quote_command(message):
+    target = message.reply_to_message
+    custom_text = re.sub(r'^/(?:q|quote)(?:@\S+)?\s*', '', (message.text or ''), flags=re.IGNORECASE).strip()
+
+    if target:
+        user = target.from_user
+        if getattr(target, 'forward_from', None):
+            user = target.forward_from
+        quote_text = custom_text or target.text or target.caption or ""
+        if not quote_text:
+            if target.sticker:
+                quote_text = f"[Стикер {target.sticker.emoji or ''}]"
+            elif target.photo:
+                quote_text = "[Фотография]"
+            elif target.video:
+                quote_text = "[Видео]"
+            elif target.voice:
+                quote_text = "[Голосовое сообщение]"
+            elif target.video_note:
+                quote_text = "[Видеосообщение]"
+            elif target.audio:
+                quote_text = f"[Аудио: {target.audio.title or 'Трек'}]"
+            else:
+                quote_text = "[Медиафайл]"
+    else:
+        if not custom_text:
+            return
+        user = message.from_user
+        quote_text = custom_text
+
+    first = (user.first_name or "").strip()
+    last = (user.last_name or "").strip()
+    display_name = f"{first} {last}".strip() or user.username or "Пользователь"
+
+    def worker():
+        try:
+            webp_io = create_quote_sticker_webp(user.id, display_name, quote_text[:400])
+            reply_id = target.message_id if target else message.message_id
+            bot.send_sticker(
+                message.chat.id,
+                webp_io,
+                reply_to_message_id=reply_id,
+                allow_sending_without_reply=True
+            )
+        except Exception:
+            traceback.print_exc()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# ==================== АУДИО / ВИДЕО РАСПОЗНАВАНИЕ ====================
+
 def get_video_duration(video_path):
     try:
         result = subprocess.run(
@@ -87,21 +398,23 @@ def get_video_duration(video_path):
         )
         for line in result.stderr.split('\n'):
             if 'Duration' in line:
-                m = re.search(r'Duration:\s*(\d+):(\d+):(\d+)', line)
+                m = re.search(r'Duration:\s*(\d+):(\d+):(\d+)(?:\.(\d+))?', line)
                 if m:
                     h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                    return h * 3600 + mi * 60 + s
+                    ms = int(m.group(4)[:2]) / 100.0 if m.group(4) else 0.0
+                    return h * 3600 + mi * 60 + s + ms
     except Exception:
         pass
-    return 0
+    return 0.0
 
 
-def extract_audio_segment(video_path, audio_path, ss=None, t=None, af_filter=None):
-    cmd = [FFMPEG_PATH, "-y", "-i", video_path]
-    if ss is not None and ss > 0:
-        cmd += ["-ss", str(ss)]
-    if t is not None:
-        cmd += ["-t", str(t)]
+def extract_pcm_window(video_path, out_wav, ss=0.0, t=5.0, af_filter=None, loop_input=False):
+    cmd = [FFMPEG_PATH, "-y"]
+    if loop_input:
+        cmd += ["-stream_loop", "2"]
+    if ss > 0:
+        cmd += ["-ss", f"{ss:.2f}"]
+    cmd += ["-i", video_path, "-t", f"{t:.2f}"]
     if af_filter:
         cmd += ["-af", af_filter]
     cmd += [
@@ -109,82 +422,242 @@ def extract_audio_segment(video_path, audio_path, ss=None, t=None, af_filter=Non
         "-acodec", "pcm_s16le",
         "-ar", "16000",
         "-ac", "1",
-        audio_path
+        out_wav
     ]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 4000:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and os.path.exists(out_wav) and os.path.getsize(out_wav) > 16000:
             return True
     except Exception as e:
-        print(f"[FFmpeg Extract Error]: {e}")
+        print(f"[FFmpeg Error]: {e}")
     return False
 
 
-async def _shazam_async(audio_path):
-    shazam = Shazam()
-    if hasattr(shazam, "recognize"):
-        return await shazam.recognize(audio_path)
-    return await shazam.recognize_song(audio_path)
-
-
-def shazam_recognize(audio_path):
-    loop = asyncio.new_event_loop()
+def extract_mp3_for_audd(video_path, out_mp3, ss=0.0, t=12.0):
+    cmd = [
+        FFMPEG_PATH, "-y",
+        "-ss", f"{ss:.2f}",
+        "-i", video_path,
+        "-t", f"{t:.2f}",
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "1",
+        out_mp3
+    ]
     try:
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(_shazam_async(audio_path))
-        if not result:
-            return None
-        track = result.get("track")
-        if not track:
-            return None
-        return {
-            "title": track.get("title", ""),
-            "artist": track.get("subtitle", ""),
-            "artwork": track.get("images", {}).get("coverarthq", ""),
-            "url": track.get("url", ""),
-        }
-    except Exception as e:
-        print(f"[Shazam Error]: {e}")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 4000:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_async_loop = asyncio.new_event_loop()
+threading.Thread(target=_async_loop.run_forever, daemon=True).start()
+
+
+async def _recognize_single_wav(shazam, wav_path, sem):
+    async with sem:
+        try:
+            if hasattr(shazam, "recognize"):
+                res = await shazam.recognize(wav_path)
+            else:
+                res = await shazam.recognize_song(wav_path)
+
+            if isinstance(res, dict):
+                track = res.get("track")
+                if track and track.get("title"):
+                    print(f"[Shazam HIT] {os.path.basename(wav_path)} -> {track.get('subtitle')} - {track.get('title')}")
+                    return {
+                        "title": track.get("title", ""),
+                        "artist": track.get("subtitle", ""),
+                        "artwork": (track.get("images") or {}).get("coverarthq", ""),
+                        "url": track.get("url", ""),
+                        "source": "shazam",
+                    }
+        except Exception as e:
+            print(f"[Shazam Attempt Error] {os.path.basename(wav_path)}: {repr(e)}")
         return None
+
+
+async def _recognize_wave_batch(wav_paths, country="US"):
+    try:
+        shazam = Shazam(language="en-US", endpoint_country=country)
+    except TypeError:
+        shazam = Shazam()
+
+    sem = asyncio.Semaphore(3)
+    tasks = [asyncio.create_task(_recognize_single_wav(shazam, p, sem)) for p in wav_paths]
+    found = None
+    try:
+        for coro in asyncio.as_completed(tasks):
+            res = await coro
+            if res:
+                found = res
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                break
     finally:
         try:
-            loop.close()
+            if hasattr(shazam, "http_client"):
+                client = shazam.http_client
+                if hasattr(client, "close"):
+                    await client.close()
+                elif hasattr(client, "client") and hasattr(client.client, "close"):
+                    await client.client.close()
         except Exception:
             pass
+    return found
+
+
+def run_shazam_batch(wav_paths, country="US"):
+    if not wav_paths:
+        return None
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_recognize_wave_batch(wav_paths, country), _async_loop)
+        return fut.result(timeout=45)
+    except Exception as e:
+        print(f"[Batch Error]: {repr(e)}")
+        return None
+
+
+def audd_recognize(mp3_path):
+    if not AUDD_API_TOKEN or not os.path.exists(mp3_path):
+        return None
+    try:
+        with open(mp3_path, "rb") as f:
+            r = requests.post(
+                "https://api.audd.io/",
+                data={"api_token": AUDD_API_TOKEN, "return": "apple_music,spotify"},
+                files={"file": ("sample.mp3", f, "audio/mpeg")},
+                timeout=30,
+            )
+        data = r.json()
+        status = data.get("status")
+        res = data.get("result")
+        print(f"[AudD] status={status} found={bool(res)}")
+        if res and res.get("title"):
+            return {
+                "title": res.get("title", ""),
+                "artist": res.get("artist", ""),
+                "artwork": "",
+                "url": res.get("song_link", ""),
+                "source": "audd",
+            }
+    except Exception as e:
+        print(f"[AudD Error]: {repr(e)}")
+    return None
+
+
+def build_sliding_offsets(duration):
+    if duration <= 0 or duration <= 6.5:
+        return [0.0]
+    offsets = []
+    mid = max(0.0, duration / 2.0 - 2.5)
+    offsets.append(round(mid, 2))
+
+    step = 2.5 if duration <= 25 else 4.0
+    cur = 0.5
+    while cur + 4.5 <= duration and len(offsets) < 7:
+        if abs(cur - mid) >= 1.8:
+            offsets.append(round(cur, 2))
+        cur += step
+
+    if duration > 7.0:
+        tail = round(max(0.0, duration - 5.5), 2)
+        if all(abs(tail - x) >= 1.5 for x in offsets):
+            offsets.append(tail)
+    return offsets[:7]
 
 
 def extract_and_recognize(video_path):
     duration = get_video_duration(video_path)
     base = os.path.splitext(video_path)[0]
+    is_very_short = 0 < duration < 4.8
+    print(f"[Recognize] duration={duration:.2f}s file={os.path.basename(video_path)}")
 
-    segments = []
-    if duration <= 10:
-        segments.append(("full", 0, 10, None))
-    elif duration <= 20:
-        mid = max(1, duration // 2 - 4)
-        segments.append(("mid", mid, 8, None))
-        segments.append(("start", 1, 8, None))
-    else:
-        mid = max(2, duration // 2 - 4)
-        segments.append(("mid", mid, 8, None))
-        segments.append(("early", 2, 8, None))
-        segments.append(("late", max(2, duration - 12), 8, None))
+    offsets = build_sliding_offsets(duration)
+    mid_offset = offsets[0]
+    created_files = []
 
-    mid_point = max(1, duration // 2 - 4) if duration > 10 else 0
-    seg_len = 8 if duration > 10 else None
-    segments.append(("un_spedup", mid_point, seg_len, "asetrate=16000*0.85,aresample=16000"))
-    segments.append(("un_slowed", mid_point, seg_len, "asetrate=16000*1.18,aresample=16000"))
-
-    for name, ss, t, af in segments:
-        audio_path = f"{base}_shazam_{name}.wav"
-        if extract_audio_segment(video_path, audio_path, ss, t, af_filter=af):
-            result = shazam_recognize(audio_path)
+    def cleanup():
+        for f in created_files:
             try:
-                os.remove(audio_path)
+                if os.path.exists(f):
+                    os.remove(f)
             except Exception:
                 pass
-            if result and result.get("title"):
-                return result
+        created_files.clear()
+
+    try:
+        wave1 = []
+        for idx, off in enumerate(offsets):
+            wav = f"{base}_w1_{idx}.wav"
+            if extract_pcm_window(video_path, wav, ss=off, t=5.2, af_filter=None, loop_input=is_very_short):
+                created_files.append(wav)
+                wave1.append(wav)
+
+        res = run_shazam_batch(wave1, country="US")
+        if res:
+            return res
+        cleanup()
+
+        wave2 = []
+        eq_filters = [
+            ("eq_clean", "highpass=f=120,lowpass=f=7000,dynaudnorm=f=100:g=15"),
+            ("eq_vocal", "highpass=f=220,lowpass=f=4500,acompressor=threshold=-18dB:ratio=3,dynaudnorm=f=100:g=15"),
+        ]
+        sample_points = offsets[:3] if len(offsets) >= 3 else offsets
+        for pt_idx, off in enumerate(sample_points):
+            for fname, flt in eq_filters:
+                wav = f"{base}_w2_{pt_idx}_{fname}.wav"
+                if extract_pcm_window(video_path, wav, ss=off, t=5.5, af_filter=flt, loop_input=is_very_short):
+                    created_files.append(wav)
+                    wave2.append(wav)
+
+        res = run_shazam_batch(wave2, country="GB")
+        if res:
+            return res
+        cleanup()
+
+        wave3 = []
+        speed_filters = [
+            ("pitch_down_12", "asetrate=16000*0.88,aresample=16000"),
+            ("pitch_down_20", "asetrate=16000*0.80,aresample=16000"),
+            ("pitch_down_26", "asetrate=16000*0.74,aresample=16000"),
+            ("pitch_up_14",   "asetrate=16000*1.14,aresample=16000"),
+            ("pitch_up_25",   "asetrate=16000*1.25,aresample=16000"),
+            ("tempo_down_15", "atempo=0.85"),
+            ("tempo_down_22", "atempo=0.78"),
+            ("tempo_up_18",   "atempo=1.18"),
+        ]
+        for sname, sflt in speed_filters:
+            wav = f"{base}_w3_{sname}.wav"
+            full_flt = f"{sflt},highpass=f=100,dynaudnorm=f=100:g=15"
+            if extract_pcm_window(video_path, wav, ss=mid_offset, t=5.5, af_filter=full_flt, loop_input=True):
+                created_files.append(wav)
+                wave3.append(wav)
+
+        res = run_shazam_batch(wave3, country="US")
+        if res:
+            return res
+        cleanup()
+
+        if AUDD_API_TOKEN:
+            mp3_path = f"{base}_audd.mp3"
+            audd_ss = max(0.0, duration / 2.0 - 6.0) if duration > 14 else 0.0
+            if extract_mp3_for_audd(video_path, mp3_path, ss=audd_ss, t=12.0):
+                created_files.append(mp3_path)
+                res = audd_recognize(mp3_path)
+                if res:
+                    return res
+
+    finally:
+        cleanup()
 
     return None
 
@@ -192,18 +665,21 @@ def extract_and_recognize(video_path):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     save_storage_chat_id(message.chat.id)
-    bot.send_message(
-        message.chat.id,
-        f'{E_WAVE} <b>Привет!</b>\n\n'
-        f'• Отправь видео (или ответь на видео словом <b>найти</b> в чате), и я распознаю трек.\n'
-        f'• Скинь ссылку (TikTok, YouTube, Instagram, Pinterest, SoundCloud), и я скачаю материал.',
-        parse_mode="HTML"
-    )
+    try:
+        bot.send_message(
+            message.chat.id,
+            f'{E_WAVE} <b>Привет!</b>\n\n'
+            f'• Отправь видео (или ответь на видео словом <b>найти</b> в чате), и я распознаю трек.\n'
+            f'• Скинь ссылку (TikTok, YouTube, Instagram, Pinterest, SoundCloud), и я скачаю материал.',
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 
 def clean_search_query(query):
     cleaned = re.sub(
-        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек|музыка)(?:@\S+)?\s*',
+        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек|музыка|текст|слова)(?:@\S+)?\s*',
         '',
         query.strip(),
         flags=re.IGNORECASE
@@ -213,7 +689,7 @@ def clean_search_query(query):
 
 def clean_track_display_title(raw_title):
     cleaned = re.sub(
-        r'(?i)\s*[\(\[](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|lyrics?|текст\s*песни|клип|hd|4k|hq|audio)[\)\]]',
+        r'(?i)\s*[\(\[](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|lyrics?|текст\s*песни|клип|hd|4k|hq|audio|mv|prod\.?[^\)\]]*)[\)\]]',
         '',
         raw_title
     )
@@ -232,61 +708,232 @@ def split_artist_title(raw_title, fallback_uploader):
     return (uploader or "Artist"), cleaned_title
 
 
+# ==================== БЕЗОПАСНЫЙ МУЗЫКАЛЬНЫЙ ПОИСК И СКАЧИВАНИЕ ====================
+
+STOP_WORDS = {
+    "но", "что", "как", "это", "все", "всё", "так", "уже", "или", "без",
+    "над", "под", "при", "про", "для", "она", "они", "оно", "мне", "меня",
+    "тебя", "тебе", "мой", "моя", "мои", "твой", "твоя", "только", "когда",
+    "если", "где", "там", "тут", "вот", "даже", "было", "была", "быть"
+}
+
+
+def get_significant_words(text):
+    words = re.findall(r'[а-яёa-z0-9]+', text.lower().replace('ё', 'е'))
+    return [w for w in words if len(w) >= 4 and w not in STOP_WORDS]
+
+
+def is_lyrics_actually_matching(query_text, candidate_lyrics):
+    if not candidate_lyrics:
+        return False
+    sig_q = get_significant_words(query_text)
+    if not sig_q:
+        return False
+
+    norm_lyrics = candidate_lyrics.lower().replace('ё', 'е')
+    matched = sum(1 for w in sig_q if w in norm_lyrics)
+    ratio = matched / len(sig_q)
+    return matched >= min(3, len(sig_q)) and ratio >= 0.65
+
+
+def search_verified_audd_lyrics(lyrics_text):
+    if not AUDD_API_TOKEN:
+        return []
+    verified = []
+    try:
+        r = http_session.post(
+            "https://api.audd.io/findLyrics/",
+            data={"api_token": AUDD_API_TOKEN, "q": lyrics_text},
+            timeout=5
+        )
+        data = r.json()
+        for item in (data.get("result") or [])[:5]:
+            artist = (item.get("artist") or "").strip()
+            title = (item.get("title") or "").strip()
+            lyrics_body = item.get("lyrics") or ""
+            if artist and title and is_lyrics_actually_matching(lyrics_text, lyrics_body):
+                q = f"{artist} - {title}"
+                if q not in verified:
+                    verified.append(q)
+    except Exception as e:
+        print(f"[AudD Lyrics Error]: {e}")
+    return verified
+
+
+def search_web_for_song(lyrics_text):
+    song_queries = []
+    search_variants = [
+        f"{lyrics_text} песня трек",
+        f"{lyrics_text} текст песни",
+    ]
+    for sq in search_variants:
+        try:
+            r = http_session.get(
+                f"https://html.duckduckgo.com/html/?q={quote_plus(sq)}",
+                timeout=6
+            )
+            if r.status_code != 200:
+                continue
+            titles = re.findall(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', r.text, flags=re.DOTALL)
+            for raw_t in titles[:6]:
+                clean_t = re.sub(r'<[^>]+>', '', raw_t).strip()
+                clean_t = re.sub(r'\s*-\s*(?:YouTube|SoundCloud).*$', '', clean_t, flags=re.IGNORECASE).strip()
+                clean_t = re.sub(
+                    r'(?i)\s*(?:[-—|:]\s*)?(?:текст\s+песни|слова\s+песни|lyrics|скачать|слушать|аккорды|перевод).*$',
+                    '',
+                    clean_t
+                ).strip()
+                if any(sep in clean_t for sep in [" - ", " — ", " – "]) and 5 < len(clean_t) < 75:
+                    if clean_t not in song_queries:
+                        song_queries.append(clean_t)
+        except Exception as e:
+            print(f"[Web Search Error]: {e}")
+    return song_queries[:4]
+
+
+def is_junk_non_music_video(raw_title, uploader=""):
+    combined = f"{raw_title} {uploader}".lower()
+    junk_patterns = [
+        r'\bcs\s*2\b', r'\bcs:?go\b', r'\bкс\s*2\b', r'\bкс\s*го\b',
+        r'\bdota\s*2?\b', r'\bдота\b', r'\bminecraft\b', r'\bмайнкрафт\b',
+        r'\broblox\b', r'\bроблокс\b', r'\bvalorant\b', r'\bвалорант\b',
+        r'\bstandoff\b', r'\bстандофф\b', r'\bpubg\b', r'\bgta\b', r'\bгта\b',
+        r'\bbrawl\s*stars\b', r'\bбравл\b', r'\bfortnite\b', r'\bфортнайт\b',
+        r'\bафк\b', r'\bafk\b', r'\blvl\b', r'\bлвл\b',
+        r'\bвзломал\b', r'\bскачал\s+всю\b', r'\bмастерскую\b',
+        r'\bглавный\s+секрет\b', r'\bпрохождение\b', r'\bлетсплей\b',
+        r'\bгайд\b', r'\bтуториал\b', r'\bобзор\b', r'\bстрим\b',
+        r'\bkaspi\b', r'\bкаспи\b', r'\bнакопительный\b',
+        r'\bbank\s+deposit\b', r'\bsavings\s+account\b', r'\bterm\s+deposit\b',
+        r'\bинвестиц\w*\b', r'\bзаработ\w*\b', r'\bмиллиард\w*\b',
+        r'\bвысказал(?:ся|ась)\b', r'\bинтервью\b', r'\bновости\b',
+        r'\bподкаст\b', r'\bразоблачение\b', r'\bреакция\b',
+        r'\bbefore\s+his\s+death\b', r'\breply\s+to\b',
+    ]
+    return any(re.search(p, combined) for p in junk_patterns)
+
+
+def is_music_like_entry(raw_title, uploader, duration):
+    if is_junk_non_music_video(raw_title, uploader):
+        return False
+    if duration > 400 or (0 < duration < 20):
+        return False
+    return True
+
+
+def score_music_relevance(track_obj, query_words):
+    score = 0
+    title_l = track_obj['title'].lower()
+    artist_l = track_obj['artist'].lower()
+    full_l = f"{artist_l} {title_l}"
+    for w in query_words:
+        if len(w) >= 2 and w in full_l:
+            score += 15
+    if any(m in artist_l for m in ["music", "muzic", "records", "official", "prod", "beats", "sound"]):
+        score += 12
+    dur = track_obj.get('duration') or 0
+    if 70 <= dur <= 270:
+        score += 8
+    elif dur > 330:
+        score -= 5
+    return score
+
+
+def build_smart_search_plan(raw_query):
+    clean_q = clean_search_query(raw_query) or raw_query.strip()
+    words = clean_q.split()
+    queries = []
+
+    if len(words) >= 5:
+        for s in search_web_for_song(clean_q):
+            if s not in queries:
+                queries.append(s)
+        for v_song in search_verified_audd_lyrics(clean_q):
+            if v_song not in queries:
+                queries.insert(0, v_song)
+        queries.append(f"{clean_q} трек")
+    else:
+        has_dash = any(sep in clean_q for sep in ["-", "—", "–"])
+        if has_dash:
+            queries.append(clean_q)
+            queries.append(f"{clean_q} трек")
+        else:
+            queries.append(f"{clean_q} песня")
+            queries.append(clean_q)
+
+    return queries[:4]
+
+
+def _append_entry_to_tracks(entry, seen_labels, tracks):
+    if not entry:
+        return
+    raw_title = (entry.get('title') or '').strip()
+    uploader = (entry.get('uploader') or entry.get('channel') or '').strip()
+    duration = int(entry.get('duration') or 0)
+
+    if not raw_title or not is_music_like_entry(raw_title, uploader, duration):
+        return
+
+    url = entry.get('url') or entry.get('webpage_url') or entry.get('id') or ''
+    if url and not url.startswith('http'):
+        if "soundcloud" in url:
+            pass
+        else:
+            url = f"https://soundcloud.com/{url}"
+
+    thumbs = entry.get('thumbnails') or []
+    thumbnail = thumbs[-1].get('url', '') if thumbs else (entry.get('thumbnail') or '')
+
+    if raw_title and url:
+        artist, title = split_artist_title(raw_title, uploader)
+        display_label = f"{artist} — {title}" if artist.lower() not in title.lower() else title
+        norm_key = display_label.lower()
+        if norm_key in seen_labels:
+            return
+        seen_labels.add(norm_key)
+
+        t_id = hashlib.md5(f"{url}_{len(tracks)}".encode()).hexdigest()[:14]
+        track_obj = {
+            'id': t_id,
+            'title': title,
+            'artist': artist,
+            'display': display_label,
+            'url': url,
+            'artwork': thumbnail,
+            'duration': duration
+        }
+        text_search_cache[t_id] = track_obj
+        tracks.append(track_obj)
+
+
 def search_youtube_tracks(query, limit=25):
-    clean_q = clean_search_query(query) or query.strip()
     tracks = []
     seen_labels = set()
+    clean_q = clean_search_query(query) or query.strip()
+    query_words = re.findall(r'[а-яёa-z0-9]+', clean_q.lower())
+    search_queries = build_smart_search_plan(clean_q)
 
     ydl_opts = {
         'extract_flat': 'in_playlist',
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        'http_headers': HEADERS,
     }
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{clean_q}", download=False)
-            entries = info.get('entries', []) if info else []
-            for entry in entries:
-                if not entry:
-                    continue
-                raw_title = (entry.get('title') or '').strip()
-                uploader = (entry.get('uploader') or entry.get('channel') or 'YouTube').strip()
-                url = entry.get('url') or entry.get('webpage_url') or entry.get('id') or ''
-                if url and not url.startswith('http'):
-                    url = f"https://www.youtube.com/watch?v={url}"
 
-                duration = int(entry.get('duration') or 0)
-                if duration > 1200:
-                    continue
+    with YoutubeDL(ydl_opts) as ydl:
+        for sq in search_queries:
+            try:
+                info = ydl.extract_info(f"scsearch10:{sq}", download=False)
+                entries = info.get('entries', []) if info else []
+                for entry in entries:
+                    _append_entry_to_tracks(entry, seen_labels, tracks)
+            except Exception as e:
+                print(f"[SoundCloud Search Error]: {e}")
+            if len(tracks) >= limit:
+                break
 
-                thumbs = entry.get('thumbnails') or []
-                thumbnail = thumbs[-1].get('url', '') if thumbs else (entry.get('thumbnail') or '')
-
-                if raw_title and url:
-                    artist, title = split_artist_title(raw_title, uploader)
-                    display_label = f"{artist} — {title}" if artist.lower() not in title.lower() else title
-                    norm_key = display_label.lower()
-                    if norm_key in seen_labels and len(tracks) > 6:
-                        continue
-                    seen_labels.add(norm_key)
-
-                    t_id = hashlib.md5(f"{url}_{len(tracks)}".encode()).hexdigest()[:14]
-                    track_obj = {
-                        'id': t_id,
-                        'title': title,
-                        'artist': artist,
-                        'display': display_label,
-                        'url': url,
-                        'artwork': thumbnail,
-                        'duration': duration
-                    }
-                    text_search_cache[t_id] = track_obj
-                    tracks.append(track_obj)
-    except Exception:
-        traceback.print_exc()
-    return tracks
+    tracks.sort(key=lambda t: score_music_relevance(t, query_words), reverse=True)
+    return tracks[:limit]
 
 
 def build_search_keyboard(session_id, page=0, per_page=9):
@@ -331,13 +978,15 @@ def build_search_keyboard(session_id, page=0, per_page=9):
 def show_track_selection(message, query_text, status_msg=None):
     chat_id = message.chat.id
     if not status_msg:
-        status_msg = bot.reply_to(message, "🔎", reply_markup=None)
+        status_msg = safe_reply(message, "🔎", reply_markup=None)
+    if not status_msg:
+        return
 
     def do_search():
         try:
             tracks = search_youtube_tracks(query_text, limit=25)
             if not tracks:
-                bot.edit_message_text("❌ Ничего не найдено", chat_id, status_msg.message_id)
+                safe_edit("❌ Ничего не найдено", chat_id, status_msg.message_id)
                 return
 
             session_id = hashlib.md5(f"{chat_id}_{status_msg.message_id}_{query_text}".encode()).hexdigest()[:12]
@@ -347,7 +996,7 @@ def show_track_selection(message, query_text, status_msg=None):
             }
 
             markup = build_search_keyboard(session_id, page=0, per_page=9)
-            bot.edit_message_text(
+            safe_edit(
                 f"🎵 Найдено по запросу: <b>{query_text}</b>",
                 chat_id,
                 status_msg.message_id,
@@ -356,10 +1005,7 @@ def show_track_selection(message, query_text, status_msg=None):
             )
         except Exception:
             traceback.print_exc()
-            try:
-                bot.edit_message_text("❌ Ошибка поиска", chat_id, status_msg.message_id)
-            except Exception:
-                pass
+            safe_edit("❌ Ошибка поиска", chat_id, status_msg.message_id)
 
     threading.Thread(target=do_search, daemon=True).start()
 
@@ -410,7 +1056,8 @@ def handle_picked_track(call):
     def do_download():
         song_path = None
         try:
-            dl_res = download_song_ytdlp(track_info['url'])
+            fallback_q = f"{track_info.get('artist', '')} {track_info.get('title', '')}".strip()
+            dl_res = download_song_ytdlp(track_info['url'], fallback_search_query=fallback_q)
             if not dl_res or not os.path.exists(dl_res['path']):
                 bot.send_message(chat_id, "❌ Не удалось скачать трек", reply_to_message_id=reply_target)
                 return
@@ -440,75 +1087,98 @@ def handle_picked_track(call):
     threading.Thread(target=do_download, daemon=True).start()
 
 
-def download_song_ytdlp(query_or_url):
-    h = hashlib.md5(query_or_url.encode()).hexdigest()[:10]
+def _finalize_downloaded_audio(ydl, info):
+    if not info:
+        return None
+    if 'entries' in info:
+        entries = [e for e in info['entries'] if e]
+        if not entries:
+            return None
+        info = entries[0]
+
+    filename = ydl.prepare_filename(info)
+    base, _ = os.path.splitext(filename)
+
+    final_path = None
+    for ext in [".mp3", ".m4a", ".ogg", ".opus", ".webm", ".wav", ".aac"]:
+        if os.path.exists(base + ext):
+            final_path = base + ext
+            break
+    if not final_path and os.path.exists(filename):
+        final_path = filename
+
+    if final_path and final_path.endswith((".webm", ".opus", ".wav", ".aac")):
+        mp3_out = base + ".mp3"
+        subprocess.run(
+            [FFMPEG_PATH, "-y", "-i", final_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", mp3_out],
+            capture_output=True, timeout=40
+        )
+        if os.path.exists(mp3_out):
+            try:
+                os.remove(final_path)
+            except Exception:
+                pass
+            final_path = mp3_out
+
+    if final_path and os.path.exists(final_path):
+        raw_title = (info.get('title') or '').strip()
+        uploader = (info.get('artist') or info.get('uploader') or info.get('channel') or '').strip()
+        artist, title = split_artist_title(raw_title, uploader)
+        if info.get('track') and info.get('artist'):
+            title = info.get('track')
+            artist = info.get('artist')
+
+        thumbs = info.get('thumbnails') or []
+        thumb = info.get('thumbnail') or (thumbs[-1].get('url', '') if thumbs else '')
+        return {
+            'path': final_path,
+            'title': title,
+            'artist': artist,
+            'thumbnail': thumb
+        }
+    return None
+
+
+def download_song_ytdlp(query_or_url, fallback_search_query=None):
+    h = hashlib.md5(f"{query_or_url}_{time.time()}".encode()).hexdigest()[:10]
     out_path = os.path.join(DOWNLOAD_DIR, f"song_{h}.%(ext)s")
-    target = query_or_url if query_or_url.startswith('http') else f"ytsearch1:{query_or_url}"
+    
+    target = query_or_url
+    if not target.startswith('http'):
+        target = f"scsearch1:{query_or_url}"
+
     ydl_opts = {
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': out_path,
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
+        'noprogress': True,
         'ffmpeg_location': FFMPEG_PATH,
-        'concurrent_fragment_downloads': 8,
         'socket_timeout': 15,
-        'retries': 3,
-        'http_headers': HEADERS,
+        'retries': 2,
     }
+
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target, download=True)
-            if not info:
-                return None
-            if 'entries' in info:
-                entries = [e for e in info['entries'] if e]
-                if not entries:
-                    return None
-                info = entries[0]
+            res = _finalize_downloaded_audio(ydl, info)
+            if res:
+                return res
+    except Exception as e:
+        print(f"[SoundCloud Download Error]: {e}")
 
-            filename = ydl.prepare_filename(info)
-            base, _ = os.path.splitext(filename)
+    sc_query = fallback_search_query or (query_or_url if not query_or_url.startswith("http") else "")
+    if sc_query:
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"scsearch1:{sc_query}", download=True)
+                res = _finalize_downloaded_audio(ydl, info)
+                if res:
+                    return res
+        except Exception as e:
+            print(f"[SoundCloud Fallback Error]: {e}")
 
-            final_path = None
-            for ext in [".m4a", ".mp3", ".ogg", ".opus", ".webm"]:
-                if os.path.exists(base + ext):
-                    final_path = base + ext
-                    break
-            if not final_path and os.path.exists(filename):
-                final_path = filename
-
-            if final_path and final_path.endswith((".webm", ".opus")):
-                mp3_out = base + ".mp3"
-                subprocess.run(
-                    [FFMPEG_PATH, "-y", "-i", final_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", mp3_out],
-                    capture_output=True, timeout=40
-                )
-                if os.path.exists(mp3_out):
-                    try:
-                        os.remove(final_path)
-                    except Exception:
-                        pass
-                    final_path = mp3_out
-
-            if final_path and os.path.exists(final_path):
-                raw_title = (info.get('title') or '').strip()
-                uploader = (info.get('artist') or info.get('uploader') or info.get('channel') or '').strip()
-                artist, title = split_artist_title(raw_title, uploader)
-                if info.get('track') and info.get('artist'):
-                    title = info.get('track')
-                    artist = info.get('artist')
-
-                thumbs = info.get('thumbnails') or []
-                thumb = info.get('thumbnail') or (thumbs[-1].get('url', '') if thumbs else '')
-                return {
-                    'path': final_path,
-                    'title': title,
-                    'artist': artist,
-                    'thumbnail': thumb
-                }
-    except Exception:
-        traceback.print_exc()
     return None
 
 
@@ -552,20 +1222,18 @@ def send_downloaded_song(chat_id, reply_to_message_id, dl_res, override_title=No
 
 def recognize_and_show_options(message, status_msg, media_path, delete_source=False):
     chat_id = message.chat.id
+    msg_id = status_msg.message_id if status_msg else None
     try:
         result = extract_and_recognize(media_path)
         if not result or not result.get("title"):
-            bot.edit_message_text("❌ Не удалось определить музыку", chat_id, status_msg.message_id)
+            safe_edit("❌ Не удалось определить музыку", chat_id, msg_id)
             return
 
         query = f"{result['artist']} — {result['title']}"
         show_track_selection(message, query, status_msg=status_msg)
     except Exception:
         traceback.print_exc()
-        try:
-            bot.edit_message_text("❌ Ошибка при определении музыки", chat_id, status_msg.message_id)
-        except Exception:
-            pass
+        safe_edit("❌ Ошибка при определении музыки", chat_id, msg_id)
     finally:
         if delete_source and media_path and os.path.exists(media_path):
             try:
@@ -591,11 +1259,14 @@ def handle_shazam(call):
     except Exception:
         pass
 
-    status_msg = bot.send_message(
-        chat_id,
-        "🔎",
-        reply_to_message_id=call.message.reply_to_message.message_id if call.message.reply_to_message else call.message.message_id
-    )
+    try:
+        status_msg = bot.send_message(
+            chat_id,
+            "🔎",
+            reply_to_message_id=call.message.reply_to_message.message_id if call.message.reply_to_message else call.message.message_id
+        )
+    except Exception:
+        return
 
     threading.Thread(
         target=recognize_and_show_options,
@@ -628,7 +1299,9 @@ def handle_telegram_media_shazam(message, target_msg):
     if not file_id:
         return
 
-    status_msg = bot.reply_to(message, "🔎")
+    status_msg = safe_reply(target_msg, "🔎")
+    if not status_msg:
+        return
 
     def worker():
         local_path = os.path.join(DOWNLOAD_DIR, f"tg_media_{chat_id}_{target_msg.message_id}.mp4")
@@ -637,13 +1310,10 @@ def handle_telegram_media_shazam(message, target_msg):
             downloaded = bot.download_file(file_info.file_path)
             with open(local_path, "wb") as f:
                 f.write(downloaded)
-            recognize_and_show_options(message, status_msg, local_path, delete_source=True)
+            recognize_and_show_options(target_msg, status_msg, local_path, delete_source=True)
         except Exception:
             traceback.print_exc()
-            try:
-                bot.edit_message_text("❌ Не удалось обработать файл", chat_id, status_msg.message_id)
-            except Exception:
-                pass
+            safe_edit("❌ Не удалось обработать файл", chat_id, status_msg.message_id)
             if os.path.exists(local_path):
                 try:
                     os.remove(local_path)
@@ -655,29 +1325,73 @@ def handle_telegram_media_shazam(message, target_msg):
 
 @bot.message_handler(content_types=['video', 'video_note', 'voice', 'audio', 'document'])
 def handle_direct_media(message):
-    if not extract_telegram_media_file_id(message):
+    file_id = extract_telegram_media_file_id(message)
+    if not file_id:
         return
+
     is_private = message.chat.type == 'private'
     caption = (message.caption or '').strip()
-    is_trigger = bool(re.match(r'^/?(?:найти|найди|шазам|shazam|трек|песня)\b', caption, flags=re.IGNORECASE))
+    is_trigger = bool(re.match(r'^/?(?:найти|найди|шазам|shazam|трек|песня|музыка)\b', caption, flags=re.IGNORECASE))
 
-    if is_private or is_trigger:
+    if is_private or is_trigger or message.video or message.video_note:
         handle_telegram_media_shazam(message, message)
 
 
 def download_tiktok_api(url, output_path):
+    real_url = url
     try:
-        res = http_session.get(f"https://tikwm.com/api/?url={quote_plus(url)}", timeout=8).json()
-        if res.get("code") == 0:
-            video_url = res["data"].get("play") or res["data"].get("hdplay")
-            if video_url:
-                r = http_session.get(video_url, timeout=15)
-                if r.status_code == 200:
+        r_head = http_session.head(url, allow_redirects=True, timeout=6)
+        if r_head.url:
+            real_url = r_head.url
+    except Exception:
+        try:
+            r_get = http_session.get(url, allow_redirects=True, timeout=6, stream=True)
+            if r_get.url:
+                real_url = r_get.url
+            r_get.close()
+        except Exception:
+            pass
+
+    for target_u in (real_url, url):
+        try:
+            res = http_session.post(
+                "https://www.tikwm.com/api/",
+                data={"url": target_u, "hd": 1},
+                timeout=10
+            ).json()
+            if res.get("code") == 0 and res.get("data"):
+                data = res["data"]
+                video_url = data.get("hdplay") or data.get("play") or data.get("wmplay")
+                if video_url:
+                    if video_url.startswith("/"):
+                        video_url = "https://www.tikwm.com" + video_url
+                    r = http_session.get(video_url, timeout=20)
+                    if r.status_code == 200 and len(r.content) > 10000:
+                        with open(output_path, "wb") as f:
+                            f.write(r.content)
+                        return True
+        except Exception as e:
+            print(f"[TikWM Error]: {e}")
+
+    vid_match = re.search(r'/(?:video|photo)/(\d+)', real_url) or re.search(r'(\d{17,20})', real_url)
+    if vid_match:
+        vid_id = vid_match.group(1)
+        direct_mirrors = [
+            f"https://d.tnktok.com/video/{vid_id}.mp4",
+            f"https://tikwm.com/video/media/play/{vid_id}.mp4",
+            f"https://tikwm.com/video/media/hdplay/{vid_id}.mp4",
+        ]
+        for mirror_url in direct_mirrors:
+            try:
+                r = http_session.get(mirror_url, allow_redirects=True, timeout=15)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if r.status_code == 200 and len(r.content) > 20000 and ("video" in ctype or "octet-stream" in ctype):
                     with open(output_path, "wb") as f:
                         f.write(r.content)
                     return True
-    except Exception:
-        pass
+            except Exception:
+                pass
+
     return False
 
 
@@ -728,6 +1442,7 @@ def download_via_ytdlp(url, output_template):
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
+        'noprogress': True,
         'ffmpeg_location': FFMPEG_PATH,
         'concurrent_fragment_downloads': 8,
         'buffersize': 1024 * 64,
@@ -735,6 +1450,7 @@ def download_via_ytdlp(url, output_template):
         'retries': 2,
         'http_headers': HEADERS,
     }
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         if 'entries' in info and info['entries']:
@@ -759,13 +1475,29 @@ def download_via_ytdlp(url, output_template):
 
 def detect_platform(url):
     u = url.lower()
-    if "tiktok.com" in u:                        return "TikTok"
-    if "instagram.com" in u:                     return "Instagram"
-    if "pinterest" in u or "pin.it" in u:        return "Pinterest"
-    if "soundcloud.com" in u:                    return "SoundCloud"
-    if "youtube.com" in u or "youtu.be" in u:    return "YouTube"
-    if "twitter.com" in u or "x.com" in u:       return "Twitter/X"
+    if "tiktok.com" in u:                       return "TikTok"
+    if "instagram.com" in u:                    return "Instagram"
+    if "pinterest" in u or "pin.it" in u:       return "Pinterest"
+    if "soundcloud.com" in u or "snd.sc" in u:  return "SoundCloud"
+    if "youtube.com" in u or "youtu.be" in u:   return "YouTube"
+    if "twitter.com" in u or "x.com" in u:      return "Twitter/X"
     return "Источник"
+
+
+SUPPORTED_DOMAINS = (
+    "tiktok.com", "instagram.com", "pin.it",
+    "soundcloud.com", "snd.sc", "youtube.com", "youtu.be", "twitter.com", "x.com",
+)
+
+
+def is_supported_url(url):
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if "pinterest." in host:
+        return True
+    return any(host == d or host.endswith("." + d) for d in SUPPORTED_DOMAINS)
 
 
 def clean_title(title):
@@ -790,22 +1522,42 @@ def process_link_download(message, url, auto_shazam=False):
     chat_id = message.chat.id
     platform = detect_platform(url)
 
-    if "soundcloud.com" in url.lower() and not auto_shazam:
-        status_msg = bot.reply_to(message, "🔎")
-        def sc_handle():
+    if ("soundcloud.com" in url.lower() or "snd.sc" in url.lower()) and not auto_shazam:
+        status_msg = safe_reply(message, f'{E_DL} <i>Скачиваю с SoundCloud...</i>', parse_mode="HTML")
+        if not status_msg:
+            return
+
+        def sc_download():
+            song_path = None
             try:
-                with YoutubeDL({'quiet': True, 'no_warnings': True, 'extract_flat': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    title = (info.get('title') or '').strip()
-                    uploader = (info.get('uploader') or '').strip()
-                    q = f"{uploader} {title}".strip() if title else url
-                    show_track_selection(message, q, status_msg=status_msg)
+                dl_res = download_song_ytdlp(url)
+                if not dl_res or not os.path.exists(dl_res['path']):
+                    safe_edit("❌ Не удалось скачать трек с SoundCloud", chat_id, status_msg.message_id)
+                    return
+
+                song_path = dl_res['path']
+                safe_edit(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
+                send_downloaded_song(chat_id, message.message_id, dl_res)
+                try:
+                    bot.delete_message(chat_id, status_msg.message_id)
+                except Exception:
+                    pass
             except Exception:
-                show_track_selection(message, url, status_msg=status_msg)
-        threading.Thread(target=sc_handle, daemon=True).start()
+                traceback.print_exc()
+                safe_edit("❌ Ошибка при отправке трека", chat_id, status_msg.message_id)
+            finally:
+                if song_path and os.path.exists(song_path):
+                    try:
+                        os.remove(song_path)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=sc_download, daemon=True).start()
         return
 
-    status_msg = bot.reply_to(message, f'{E_DL} <i>Скачиваю с {platform}...</i>', parse_mode="HTML")
+    status_msg = safe_reply(message, f'{E_DL} <i>Скачиваю с {platform}...</i>', parse_mode="HTML")
+    if not status_msg:
+        return
 
     unique_id   = f"{chat_id}_{message.message_id}"
     out_tmpl    = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
@@ -818,16 +1570,19 @@ def process_link_download(message, url, auto_shazam=False):
             if "tiktok.com" in url:
                 if download_tiktok_api(url, tiktok_path):
                     if auto_shazam:
-                        bot.edit_message_text("🔎", chat_id, status_msg.message_id)
+                        safe_edit("🔎", chat_id, status_msg.message_id)
                         recognize_and_show_options(message, status_msg, tiktok_path, delete_source=True)
                         return
 
-                    bot.edit_message_text(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
+                    safe_edit(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
                     markup = make_shazam_markup(tiktok_path)
                     with open(tiktok_path, "rb") as video:
                         bot.send_video(chat_id, video, reply_markup=markup, reply_to_message_id=message.message_id, timeout=120)
                     video_cache[unique_id] = tiktok_path
-                    bot.delete_message(chat_id, status_msg.message_id)
+                    try:
+                        bot.delete_message(chat_id, status_msg.message_id)
+                    except Exception:
+                        pass
                     return
 
             media_info = None
@@ -843,7 +1598,7 @@ def process_link_download(message, url, auto_shazam=False):
                 media_info = download_pinterest_fallback(url, unique_id)
 
             if not media_info:
-                bot.edit_message_text("❌ Не получилось скачать", chat_id, status_msg.message_id)
+                safe_edit("❌ Не получилось скачать", chat_id, status_msg.message_id)
                 return
 
             file_path = media_info["path"]
@@ -851,11 +1606,11 @@ def process_link_download(message, url, auto_shazam=False):
 
             if file_path and os.path.exists(file_path):
                 if auto_shazam:
-                    bot.edit_message_text("🔎", chat_id, status_msg.message_id)
+                    safe_edit("🔎", chat_id, status_msg.message_id)
                     recognize_and_show_options(message, status_msg, file_path, delete_source=True)
                     return
 
-                bot.edit_message_text(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
+                safe_edit(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
                 ext   = media_info["ext"].lower()
                 clean = clean_title(media_info.get("title", ""))
 
@@ -881,16 +1636,16 @@ def process_link_download(message, url, auto_shazam=False):
                     else:
                         bot.send_document(chat_id, f, visible_file_name=f"{clean or 'media'}.{ext}", reply_to_message_id=message.message_id, timeout=120)
 
-                bot.delete_message(chat_id, status_msg.message_id)
+                try:
+                    bot.delete_message(chat_id, status_msg.message_id)
+                except Exception:
+                    pass
             else:
-                bot.edit_message_text("❌ Не получилось скачать", chat_id, status_msg.message_id)
+                safe_edit("❌ Не получилось скачать", chat_id, status_msg.message_id)
 
         except Exception:
             traceback.print_exc()
-            try:
-                bot.edit_message_text("❌ Ошибка при скачивании по ссылке", chat_id, status_msg.message_id)
-            except Exception:
-                pass
+            safe_edit("❌ Ошибка при скачивании по ссылке", chat_id, status_msg.message_id)
             if file_path and os.path.exists(file_path):
                 try:
                     os.remove(file_path)
@@ -908,7 +1663,7 @@ def process_link_download(message, url, auto_shazam=False):
 @bot.message_handler(func=lambda m: m.text is not None)
 def handle_all_text(message):
     text = message.text.strip()
-    if not text or text.startswith('/start') or text.startswith('/help'):
+    if not text or text.startswith('/start') or text.startswith('/help') or re.match(r'^/(?:q|quote)\b', text, re.I):
         return
 
     chat_id = message.chat.id
@@ -917,25 +1672,31 @@ def handle_all_text(message):
 
     url_match = re.search(r'https?://\S+', text)
     has_search_prefix = bool(re.match(
-        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек)\b',
+        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек|музыка|текст|слова)\b',
         text,
         flags=re.IGNORECASE
     ))
 
     if url_match:
         url = url_match.group(0)
+        if not is_supported_url(url):
+            if is_private or has_search_prefix:
+                safe_reply(message, "❌ Эта ссылка не поддерживается")
+            return
         process_link_download(message, url, auto_shazam=has_search_prefix)
         return
 
     if has_search_prefix and message.reply_to_message:
-        if extract_telegram_media_file_id(message.reply_to_message):
-            handle_telegram_media_shazam(message, message.reply_to_message)
-            return
-        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
-        reply_url_match = re.search(r'https?://\S+', reply_text)
-        if reply_url_match:
-            process_link_download(message, reply_url_match.group(0), auto_shazam=True)
-            return
+        q_after_cmd = clean_search_query(text)
+        if not q_after_cmd:
+            if extract_telegram_media_file_id(message.reply_to_message):
+                handle_telegram_media_shazam(message, message.reply_to_message)
+                return
+            reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+            reply_url_match = re.search(r'https?://\S+', reply_text)
+            if reply_url_match:
+                process_link_download(message, reply_url_match.group(0), auto_shazam=True)
+                return
 
     if has_search_prefix:
         q_text = clean_search_query(text)
