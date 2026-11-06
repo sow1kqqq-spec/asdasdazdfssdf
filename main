@@ -46,17 +46,22 @@ apihelper.READ_TIMEOUT = 120
 apihelper.CONNECT_TIMEOUT = 30
 apihelper.ENABLE_MIDDLEWARE = True
 
+# токены ТОЛЬКО из переменных окружения, в коде не хранить
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8983080155:AAFiQSvuHDLtJCgW21nkZvq3iCZYOS4Dsko").strip()
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN не задан: добавь его в переменные окружения панели")
 bot = TeleBot(BOT_TOKEN, num_threads=16)
 
 # Кэш для мульти-цитат
 chat_history_cache = defaultdict(list)
+
 
 @bot.middleware_handler(update_types=['message'])
 def cache_messages(bot_instance, message):
     chat_history_cache[message.chat.id].append(message)
     if len(chat_history_cache[message.chat.id]) > 100:
         chat_history_cache[message.chat.id].pop(0)
+
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data" if os.path.exists("/app") else "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -71,6 +76,7 @@ COOKIES_FILE = os.path.join(DATA_DIR, "cookies.txt")
 if not os.path.exists(COOKIES_FILE):
     COOKIES_FILE = "cookies.txt"
 
+
 def _is_valid_netscape_cookies(path):
     if not os.path.exists(path) or os.path.getsize(path) < 50:
         return False
@@ -82,6 +88,7 @@ def _is_valid_netscape_cookies(path):
     except Exception:
         pass
     return False
+
 
 if os.path.exists(COOKIES_FILE) and not _is_valid_netscape_cookies(COOKIES_FILE):
     try:
@@ -115,7 +122,7 @@ HEADERS = {
 http_session = requests.Session()
 http_session.headers.update(HEADERS)
 
-AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "f3919b38ccbd318f14e539e930efd9cf").strip()
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "").strip()
 
 E_DL      = '<tg-emoji emoji-id="6039802767931871481">\U00002b07\U0000fe0f</tg-emoji>'
 E_SEND    = '<tg-emoji emoji-id="5377811534384768829">\U0001f4e4</tg-emoji>'
@@ -2353,19 +2360,19 @@ def download_via_ytdlp(url, output_template):
 
 def detect_platform(url):
     u = url.lower()
-    if "tiktok.com" in u:                 return "TikTok"
-    if "instagram.com" in u:              return "Instagram"
-    if "pinterest" in u or "pin.it" in u:     return "Pinterest"
+    if "tiktok.com" in u:                      return "TikTok"
+    if "instagram.com" in u:                   return "Instagram"
+    if "pinterest" in u or "pin.it" in u:      return "Pinterest"
     if "soundcloud.com" in u or "snd.sc" in u: return "SoundCloud"
-    if "youtube.com" in u or "youtu.be" in u: return "YouTube"
-    if "twitter.com" in u or "x.com" in u:    return "Twitter/X"
-    if "tenor.com" in u:                  return "Tenor"
-    if "giphy.com" in u:                  return "Giphy"
-    if "imgur.com" in u:                  return "Imgur"
-    if "reddit.com" in u or "redd.it" in u:   return "Reddit"
-    if "vk.com" in u or "vkvideo.ru" in u:    return "VK"
-    if "coub.com" in u:                   return "Coub"
-    if "9gag.com" in u:                   return "9GAG"
+    if "youtube.com" in u or "youtu.be" in u:  return "YouTube"
+    if "twitter.com" in u or "x.com" in u:     return "Twitter/X"
+    if "tenor.com" in u:                       return "Tenor"
+    if "giphy.com" in u:                       return "Giphy"
+    if "imgur.com" in u:                       return "Imgur"
+    if "reddit.com" in u or "redd.it" in u:    return "Reddit"
+    if "vk.com" in u or "vkvideo.ru" in u:     return "VK"
+    if "coub.com" in u:                        return "Coub"
+    if "9gag.com" in u:                        return "9GAG"
     return "Источник"
 
 
@@ -2519,7 +2526,7 @@ def process_link_download(message, raw_url, auto_shazam=False):
         return
 
     unique_id = f"{chat_id}_{message.message_id}"
-    out_tmpl  = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    out_tmpl = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
     file_path = None
 
     def process_url():
@@ -2628,7 +2635,7 @@ def process_link_download(message, raw_url, auto_shazam=False):
                     recognize_and_show_options(message, status_msg, file_path, delete_source=True, owner_id=requester_id)
                     return
 
-                ext  = media_info["ext"].lower()
+                ext = media_info["ext"].lower()
                 clean = clean_title(media_info.get("title", ""))
                 safe_edit(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
 
